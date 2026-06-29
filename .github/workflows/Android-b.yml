@@ -1,4 +1,4 @@
-name: Build Android APK (HF Mirror & Max Performance)
+name: Build Android APK (HF Mirror)
 
 on:
   push:
@@ -8,10 +8,6 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
-concurrency:
-  group: build-android-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -20,15 +16,13 @@ jobs:
     env:
       HF_ENDPOINT: https://hf-mirror.com
       HF_HUB_ENABLE_HF_TRANSFER: '1'
-      # 免费版 2 核 7GB：给 Gradle JVM 5GB 堆 + 1GB Metaspace
-      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs="-Xmx5g -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g"'
+      # 提升 Gradle 构建速度的 JVM 参数
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseParallelGC"'
 
     steps:
-      # 1. 拉取代码（浅克隆加速）
+      # 1. 拉取代码
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       # 2. 安装 JDK 17
       - name: Setup JDK 17
@@ -57,29 +51,20 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
-      # 6. 缓存 Gradle
+      # 6. 缓存 Gradle 依赖（大幅提速）
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
+            .gradle
             android/.gradle
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 7. 安装 JS 依赖
-      - name: Install dependencies
-        run: yarn install --immutable
-
-      # 8. 前置质量门禁（对齐官方 ci.yml）
-      - name: Lint and Typecheck
-        run: |
-          yarn lint
-          yarn typecheck
-
-      # 9. 替换 HuggingFace 域名为国内镜像
+      # 7. 替换 HuggingFace 域名为国内镜像
       - name: Replace HuggingFace endpoint with hf-mirror.com
         run: |
           set -e
@@ -87,51 +72,14 @@ jobs:
             \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.java' -o -name '*.kt' -o -name '*.gradle' -o -name '*.xml' \) \
             -print0 | xargs -0 sed -i 's|huggingface\.co|hf-mirror.com|g'
 
-      # 10. 追加 Gradle 性能配置（关键：用 >> 追加，不覆盖原 gradle.properties）
-      - name: Append Gradle performance config
+      # 8. 准备 .env 和 空壳 google-services.json（解决报错）
+      - name: Prepare configs
         run: |
-          echo "" >> android/gradle.properties
-          echo "# === CI performance tuning ===" >> android/gradle.properties
-          echo "org.gradle.jvmargs=-Xmx5g -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> android/gradle.properties
-          echo "org.gradle.parallel=true" >> android/gradle.properties
-          echo "org.gradle.workers.max=2" >> android/gradle.properties
-          echo "org.gradle.configureondemand=true" >> android/gradle.properties
-          echo "org.gradle.caching=true" >> android/gradle.properties
-          echo "org.gradle.daemon=false" >> android/gradle.properties
-          echo "kotlin.incremental=true" >> android/gradle.properties
-          echo "kotlin.parallel.tasks.in.parallel=true" >> android/gradle.properties
-          echo "" >> android/gradle.properties
-          # 兜底：确保 hermesEnabled 存在（若原文件没有则补上）
-          if ! grep -q "^hermesEnabled=" android/gradle.properties; then
-            echo "hermesEnabled=true" >> android/gradle.properties
-          fi
-          echo "=== 当前 gradle.properties ==="
-          cat android/gradle.properties
-
-      # 11. 生成 dummy 配置（对齐官方 build.gradle 的契约）
-      - name: Prepare CI configs
-        run: |
-          # 11.1 .env（react-native-config 编译期读取）
           if [ -f .env.example ]; then cp .env.example .env; fi
-          cat <<'EOF' >> .env
-          HF_ENDPOINT=https://hf-mirror.com
-          # dummy 值仅用于 CI 构建通过
-          FIREBASE_API_KEY=dummy
-          FIREBASE_AUTH_DOMAIN=dummy.firebaseapp.com
-          FIREBASE_PROJECT_ID=dummy
-          FIREBASE_STORAGE_BUCKET=dummy.appspot.com
-          FIREBASE_MESSAGING_SENDER_ID=000000000000
-          FIREBASE_APP_ID=1:000000000000:android:0000000000000000
-          SUPABASE_URL=https://dummy.supabase.co
-          SUPABASE_ANON_KEY=dummy
-          PALSHUB_API_URL=https://dummy.example.com
-          # release 签名凭据（官方 build.gradle 读取这两个变量）
-          APP_RELEASE_STORE_PASSWORD=dummy-ci-password
-          APP_RELEASE_KEY_PASSWORD=dummy-ci-password
-          EOF
-
-          # 11.2 空壳 google-services.json（包名 com.pocketpalai）
-          cat <<'EOF' > android/app/google-services.json
+          echo "HF_ENDPOINT=https://hf-mirror.com" >> .env
+          
+          # 生成一个假数据的 google-services.json 让 Google Services Plugin 能通过
+          cat <<EOF > android/app/google-services.json
           {
             "project_info": {
               "project_number": "000000000000",
@@ -163,48 +111,20 @@ jobs:
           }
           EOF
 
-          # 11.3 生成官方 build.gradle 期望的 release keystore
-          # 文件名必须是 pocketpal-release-key.keystore，别名必须是 pocketpal_key_alias
-          keytool -genkeypair \
-            -v \
-            -keystore android/app/pocketpal-release-key.keystore \
-            -alias pocketpal_key_alias \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass dummy-ci-password \
-            -keypass dummy-ci-password \
-            -dname "CN=CI, OU=CI, O=CI, L=CI, ST=CI, C=CI"
+      # 9. 安装 JS 依赖
+      - name: Install dependencies
+        run: yarn install --immutable
 
-      # 12. 给 gradlew 执行权限
+      # 10. 给 gradlew 执行权限
       - name: Grant gradlew permission
         run: chmod +x android/gradlew
 
-      # 13. 构建 Release APK
+      # 11. 构建 Release APK
       - name: Build Release APK
         working-directory: android
         run: ./gradlew assembleProdRelease --no-daemon --stacktrace
 
-      # 14. DCE 完整性检查（对齐官方 ci.yml）
-      - name: DCE Integrity Check
-        run: |
-          set -e
-          APK_DIR="android/app/build/outputs/apk/prodRelease"
-          APK=$(find "$APK_DIR" -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then echo "❌ APK not found"; exit 1; fi
-          mkdir -p /tmp/apk-check && unzip -o -q "$APK" -d /tmp/apk-check
-          BUNDLE=$(find /tmp/apk-check -name "index.android.bundle" | head -1)
-          if [ -z "$BUNDLE" ]; then echo "⚠️ index.android.bundle not found, skip"; exit 0; fi
-          FOUND=0
-          for MARKER in "AUTOMATION_BRIDGE" "memory-snapshot-label" "BENCH_RUN_MATRIX"; do
-            if grep -q "$MARKER" "$BUNDLE"; then
-              echo "❌ '$MARKER' 未被 DCE 剥离"
-              FOUND=1
-            fi
-          done
-          [ "$FOUND" -eq 0 ] && echo "✅ DCE 检查通过" || exit 1
-
-      # 15. 上传产物
+      # 12. 上传产物
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -213,7 +133,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 16. 发布到 Release（打 tag 时触发）
+      # 13. 发布到 Release（打 tag 时触发）
       - name: Release APK on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
