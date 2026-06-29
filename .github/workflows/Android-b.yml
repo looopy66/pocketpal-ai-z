@@ -1,4 +1,4 @@
-name: Build Android APK (Find Max Performance)
+name: Build Android APK (Sequential Max Performance)
 
 on:
   push:
@@ -7,39 +7,88 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-android:
-    # 策略矩阵：同时尝试多种高配运行器
-    strategy:
-      fail-fast: false # 关键：即使 16核 不可用，也不影响 8核、4核 继续尝试
-      matrix:
-        include:
-          - runner: ubuntu-latest-16-cores
-            cores: 16
-            xmx: 48g
-            metaspace: 4g
-          - runner: ubuntu-latest-8-cores
-            cores: 8
-            xmx: 24g
-            metaspace: 2g
-          - runner: ubuntu-latest-4-cores
-            cores: 4
-            xmx: 12g
-            metaspace: 1g
-          - runner: ubuntu-latest # 默认标准 2核 7G 机器
-            cores: 2
-            xmx: 5g
-            metaspace: 1g
+  # ==========================================
+  # 第一阶段：快速探测可用的最高性能 Runner
+  # ==========================================
+  probe-16:
+    runs-on: ubuntu-latest-16-cores
+    timeout-minutes: 5
+    steps:
+      - run: echo "16-core runner is available"
 
-    runs-on: ${{ matrix.runner }}
+  probe-8:
+    runs-on: ubuntu-latest-8-cores
+    needs: probe-16
+    if: failure() # 只有 16 核不可用时才尝试 8 核
+    timeout-minutes: 5
+    steps:
+      - run: echo "8-core runner is available"
+
+  probe-4:
+    runs-on: ubuntu-latest-4-cores
+    needs: probe-8
+    if: failure()
+    timeout-minutes: 5
+    steps:
+      - run: echo "4-core runner is available"
+
+  determine-runner:
+    runs-on: ubuntu-latest
+    needs: [probe-16, probe-8, probe-4]
+    if: always()
+    outputs:
+      runner: ${{ steps.set-runner.outputs.runner }}
+      cores: ${{ steps.set-runner.outputs.cores }}
+      xmx: ${{ steps.set-runner.outputs.xmx }}
+      metaspace: ${{ steps.set-runner.outputs.metaspace }}
+    steps:
+      - id: set-runner
+        run: |
+          if [ "${{ needs.probe-16.result }}" == "success" ]; then
+            echo "runner=ubuntu-latest-16-cores" >> $GITHUB_OUTPUT
+            echo "cores=16" >> $GITHUB_OUTPUT
+            echo "xmx=48g" >> $GITHUB_OUTPUT
+            echo "metaspace=4g" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.probe-8.result }}" == "success" ]; then
+            echo "runner=ubuntu-latest-8-cores" >> $GITHUB_OUTPUT
+            echo "cores=8" >> $GITHUB_OUTPUT
+            echo "xmx=24g" >> $GITHUB_OUTPUT
+            echo "metaspace=2g" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.probe-4.result }}" == "success" ]; then
+            echo "runner=ubuntu-latest-4-cores" >> $GITHUB_OUTPUT
+            echo "cores=4" >> $GITHUB_OUTPUT
+            echo "xmx=12g" >> $GITHUB_OUTPUT
+            echo "metaspace=1g" >> $GITHUB_OUTPUT
+          else
+            echo "runner=ubuntu-latest" >> $GITHUB_OUTPUT
+            echo "cores=2" >> $GITHUB_OUTPUT
+            echo "xmx=5g" >> $GITHUB_OUTPUT
+            echo "metaspace=1g" >> $GITHUB_OUTPUT
+          fi
+
+  # ==========================================
+  # 第二阶段：在最高性能 Runner 上执行真正的编译
+  # ==========================================
+  build-android:
+    needs: determine-runner
+    runs-on: ${{ needs.determine-runner.outputs.runner }}
     timeout-minutes: 60
 
     env:
       HF_ENDPOINT: https://hf-mirror.com
       HF_HUB_ENABLE_HF_TRANSFER: '1'
-      # 根据矩阵动态分配 JVM 内存
-      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs="-Xmx${{ matrix.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ matrix.metaspace }}"'
+      CORES: ${{ needs.determine-runner.outputs.cores }}
+      XMX: ${{ needs.determine-runner.outputs.xmx }}
+      METASPACE: ${{ needs.determine-runner.outputs.metaspace }}
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs="-Xmx${{ needs.determine-runner.outputs.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ needs.determine-runner.outputs.metaspace }}"'
 
     steps:
+      - name: Display Selected Runner Info
+        run: |
+          echo "当前使用的运行器: ${{ needs.determine-runner.outputs.runner }}"
+          echo "分配的核心数: ${{ needs.determine-runner.outputs.cores }}"
+          echo "分配的 JVM 内存: ${{ needs.determine-runner.outputs.xmx }}"
+
       # 1. 拉取代码
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,7 +120,7 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
-      # 6. 全方位缓存（加入 runner 名称以区分缓存）
+      # 6. 全方位缓存（极限提速）
       - name: Cache Gradle and Node
         uses: actions/cache@v4
         with:
@@ -81,9 +130,9 @@ jobs:
             .gradle
             android/.gradle
             node_modules
-          key: ${{ runner.os }}-${{ matrix.runner }}-all-cache-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'yarn.lock') }}
+          key: ${{ runner.os }}-${{ needs.determine-runner.outputs.runner }}-all-cache-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'yarn.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.runner }}-all-cache-
+            ${{ runner.os }}-${{ needs.determine-runner.outputs.runner }}-all-cache-
 
       # 7. 替换 HuggingFace 域名为国内镜像
       - name: Replace HuggingFace endpoint with hf-mirror.com
@@ -93,15 +142,15 @@ jobs:
             \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.java' -o -name '*.kt' -o -name '*.gradle' -o -name '*.xml' \) \
             -print0 | xargs -0 sed -i 's|huggingface\.co|hf-mirror.com|g'
 
-      # 8. 极限优化 Gradle 配置 (根据矩阵核心数写入 workers.max)
+      # 8. 极限优化 Gradle 配置 (根据探测到的核心数写入)
       - name: Maximize Gradle Performance
         run: |
           cat <<EOF > android/gradle.properties
           # JVM 配置
-          org.gradle.jvmargs=-Xmx${{ matrix.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ matrix.metaspace }} -Dfile.encoding=UTF-8
-          # 并行构建 (利用当前矩阵的 CPU 核心)
+          org.gradle.jvmargs=-Xmx${{ env.XMX }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ env.METASPACE }} -Dfile.encoding=UTF-8
+          # 并行构建
           org.gradle.parallel=true
-          org.gradle.workers.max=${{ matrix.cores }}
+          org.gradle.workers.max=${{ env.CORES }}
           # 按需配置
           org.gradle.configureondemand=true
           # 构建缓存
@@ -168,11 +217,19 @@ jobs:
         working-directory: android
         run: ./gradlew assembleProdRelease --no-daemon --stacktrace
 
-      # 13. 上传产物 (附加运行器名称以区分)
+      # 13. 上传产物
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pocketpal-ai-apk-${{ matrix.runner }}
+          name: pocketpal-ai-apk-${{ needs.determine-runner.outputs.runner }}
           path: android/app/build/outputs/apk/prodRelease/*.apk
           if-no-files-found: error
-          retention-days: 7 # 测试阶段缩短保留时间
+          retention-days: 30
+
+      # 14. 发布到 Release（打 tag 时触发）
+      - name: Release APK on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android/app/build/outputs/apk/prodRelease/*.apk
+          generate_release_notes: true
