@@ -1,44 +1,64 @@
-name: Build Android APK (HF Mirror)
+name: Build Android APK (Find Max Performance)
 
 on:
   push:
     branches: [main, master]
     tags: ['v*']
-  pull_request:
-    branches: [main, master]
-  workflow_dispatch:   # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   build-android:
-    runs-on: ubuntu-latest
+    # 策略矩阵：同时尝试多种高配运行器
+    strategy:
+      fail-fast: false # 关键：即使 16核 不可用，也不影响 8核、4核 继续尝试
+      matrix:
+        include:
+          - runner: ubuntu-latest-16-cores
+            cores: 16
+            xmx: 48g
+            metaspace: 4g
+          - runner: ubuntu-latest-8-cores
+            cores: 8
+            xmx: 24g
+            metaspace: 2g
+          - runner: ubuntu-latest-4-cores
+            cores: 4
+            xmx: 12g
+            metaspace: 1g
+          - runner: ubuntu-latest # 默认标准 2核 7G 机器
+            cores: 2
+            xmx: 5g
+            metaspace: 1g
+
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
 
     env:
-      # 让任何走 huggingface_hub / CLI 的请求都走国内镜像
       HF_ENDPOINT: https://hf-mirror.com
       HF_HUB_ENABLE_HF_TRANSFER: '1'
-      # Gradle / JVM 走镜像也能加速（如需要可再加）
-      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true'
+      # 根据矩阵动态分配 JVM 内存
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs="-Xmx${{ matrix.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ matrix.metaspace }}"'
 
     steps:
-      # 1. 拉代码
+      # 1. 拉取代码
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. 安装 JDK 17（React Native 0.74+ 要求 JDK 17）
+      # 2. 安装 JDK 17
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. 安装 Node 22（package.json engines 要求 >=22.21.0）
+      # 3. 安装 Node 22
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: 'yarn'
 
-      # 4. 安装 Yarn 1.22.22（与 packageManager 字段一致）
+      # 4. 安装 Yarn
       - name: Setup Yarn
         run: |
           corepack enable
@@ -51,53 +71,108 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
-      # 6. 关键：把源码中的 huggingface.co 替换为 hf-mirror.com
+      # 6. 全方位缓存（加入 runner 名称以区分缓存）
+      - name: Cache Gradle and Node
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .gradle
+            android/.gradle
+            node_modules
+          key: ${{ runner.os }}-${{ matrix.runner }}-all-cache-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.runner }}-all-cache-
+
+      # 7. 替换 HuggingFace 域名为国内镜像
       - name: Replace HuggingFace endpoint with hf-mirror.com
         run: |
           set -e
-          echo "替换前引用情况："
-          grep -rn "huggingface.co" src/ android/ || true
-          # 仅替换字面量域名，不动其他内容
           find src android -type f \
             \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.java' -o -name '*.kt' -o -name '*.gradle' -o -name '*.xml' \) \
             -print0 | xargs -0 sed -i 's|huggingface\.co|hf-mirror.com|g'
-          echo "替换后引用情况："
-          grep -rn "hf-mirror.com" src/ android/ | head -50
 
-      # 7. （可选）准备 .env 文件，react-native-config 在 release 构建时会读取
-      - name: Prepare .env
+      # 8. 极限优化 Gradle 配置 (根据矩阵核心数写入 workers.max)
+      - name: Maximize Gradle Performance
+        run: |
+          cat <<EOF > android/gradle.properties
+          # JVM 配置
+          org.gradle.jvmargs=-Xmx${{ matrix.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ matrix.metaspace }} -Dfile.encoding=UTF-8
+          # 并行构建 (利用当前矩阵的 CPU 核心)
+          org.gradle.parallel=true
+          org.gradle.workers.max=${{ matrix.cores }}
+          # 按需配置
+          org.gradle.configureondemand=true
+          # 构建缓存
+          org.gradle.caching=true
+          org.gradle.daemon=false
+          # Kotlin 编译优化
+          kotlin.incremental=true
+          kotlin.parallel.tasks.in.parallel=true
+          kotlin.code.style=official
+          # AndroidX
+          android.useAndroidX=true
+          android.enableJetifier=false
+          android.nonTransitiveRClass=true
+          EOF
+
+      # 9. 准备 .env 和 空壳 google-services.json
+      - name: Prepare configs
         run: |
           if [ -f .env.example ]; then cp .env.example .env; fi
-          # 注入 HF 镜像端点，供 react-native-config 编译期使用
           echo "HF_ENDPOINT=https://hf-mirror.com" >> .env
+          
+          cat <<EOF > android/app/google-services.json
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "dummy-project",
+              "storage_bucket": "dummy-project.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.pocketpalai"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDummy_key_for_ci_build_only"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
 
-      # 8. 安装 JS 依赖（会触发 postinstall: ./scripts/postinstall.sh）
+      # 10. 安装 JS 依赖
       - name: Install dependencies
         run: yarn install --immutable
 
-      # 9. 给 gradlew 执行权限
+      # 11. 给 gradlew 执行权限
       - name: Grant gradlew permission
         run: chmod +x android/gradlew
 
-      # 10. 构建 Release APK（项目使用 productFlavors: prod）
+      # 12. 构建 Release APK
       - name: Build Release APK
         working-directory: android
         run: ./gradlew assembleProdRelease --no-daemon --stacktrace
 
-      # 11. 上传产物
+      # 13. 上传产物 (附加运行器名称以区分)
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pocketpal-ai-apk
+          name: pocketpal-ai-apk-${{ matrix.runner }}
           path: android/app/build/outputs/apk/prodRelease/*.apk
           if-no-files-found: error
-          retention-days: 30
-
-      # 12. 如果是 tag 推送，则发布到 GitHub Release
-      - name: Release APK on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: android/app/build/outputs/apk/prodRelease/*.apk
-          generate_release_notes: true
-
+          retention-days: 7 # 测试阶段缩短保留时间
