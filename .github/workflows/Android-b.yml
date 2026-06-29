@@ -1,9 +1,8 @@
-name: Build Android APK (Sequential Max Performance)
+name: Test Runner Max Performance
 
 on:
   push:
     branches: [main, master]
-    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -39,197 +38,47 @@ jobs:
     outputs:
       runner: ${{ steps.set-runner.outputs.runner }}
       cores: ${{ steps.set-runner.outputs.cores }}
-      xmx: ${{ steps.set-runner.outputs.xmx }}
-      metaspace: ${{ steps.set-runner.outputs.metaspace }}
     steps:
       - id: set-runner
         run: |
           if [ "${{ needs.probe-16.result }}" == "success" ]; then
             echo "runner=ubuntu-latest-16-cores" >> $GITHUB_OUTPUT
             echo "cores=16" >> $GITHUB_OUTPUT
-            echo "xmx=48g" >> $GITHUB_OUTPUT
-            echo "metaspace=4g" >> $GITHUB_OUTPUT
           elif [ "${{ needs.probe-8.result }}" == "success" ]; then
             echo "runner=ubuntu-latest-8-cores" >> $GITHUB_OUTPUT
             echo "cores=8" >> $GITHUB_OUTPUT
-            echo "xmx=24g" >> $GITHUB_OUTPUT
-            echo "metaspace=2g" >> $GITHUB_OUTPUT
           elif [ "${{ needs.probe-4.result }}" == "success" ]; then
             echo "runner=ubuntu-latest-4-cores" >> $GITHUB_OUTPUT
             echo "cores=4" >> $GITHUB_OUTPUT
-            echo "xmx=12g" >> $GITHUB_OUTPUT
-            echo "metaspace=1g" >> $GITHUB_OUTPUT
           else
             echo "runner=ubuntu-latest" >> $GITHUB_OUTPUT
             echo "cores=2" >> $GITHUB_OUTPUT
-            echo "xmx=5g" >> $GITHUB_OUTPUT
-            echo "metaspace=1g" >> $GITHUB_OUTPUT
           fi
 
   # ==========================================
-  # 第二阶段：在最高性能 Runner 上执行真正的编译
+  # 第二阶段：在探测到的最高性能机器上打印系统信息
   # ==========================================
-  build-android:
+  test-runner:
     needs: determine-runner
     runs-on: ${{ needs.determine-runner.outputs.runner }}
-    timeout-minutes: 60
-
-    env:
-      HF_ENDPOINT: https://hf-mirror.com
-      HF_HUB_ENABLE_HF_TRANSFER: '1'
-      CORES: ${{ needs.determine-runner.outputs.cores }}
-      XMX: ${{ needs.determine-runner.outputs.xmx }}
-      METASPACE: ${{ needs.determine-runner.outputs.metaspace }}
-      GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true -Dorg.gradle.jvmargs="-Xmx${{ needs.determine-runner.outputs.xmx }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ needs.determine-runner.outputs.metaspace }}"'
+    timeout-minutes: 10
 
     steps:
-      - name: Display Selected Runner Info
+      - name: Print Test Result
         run: |
-          echo "当前使用的运行器: ${{ needs.determine-runner.outputs.runner }}"
-          echo "分配的核心数: ${{ needs.determine-runner.outputs.cores }}"
-          echo "分配的 JVM 内存: ${{ needs.determine-runner.outputs.xmx }}"
-
-      # 1. 拉取代码
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # 2. 安装 JDK 17
-      - name: Setup JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      # 3. 安装 Node 22
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'yarn'
-
-      # 4. 安装 Yarn
-      - name: Setup Yarn
-        run: |
-          corepack enable
-          corepack prepare yarn@1.22.22 --activate
-          yarn --version
-
-      # 5. 配置 Android SDK
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
-
-      # 6. 全方位缓存（极限提速）
-      - name: Cache Gradle and Node
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            .gradle
-            android/.gradle
-            node_modules
-          key: ${{ runner.os }}-${{ needs.determine-runner.outputs.runner }}-all-cache-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ needs.determine-runner.outputs.runner }}-all-cache-
-
-      # 7. 替换 HuggingFace 域名为国内镜像
-      - name: Replace HuggingFace endpoint with hf-mirror.com
-        run: |
-          set -e
-          find src android -type f \
-            \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.java' -o -name '*.kt' -o -name '*.gradle' -o -name '*.xml' \) \
-            -print0 | xargs -0 sed -i 's|huggingface\.co|hf-mirror.com|g'
-
-      # 8. 极限优化 Gradle 配置 (根据探测到的核心数写入)
-      - name: Maximize Gradle Performance
-        run: |
-          cat <<EOF > android/gradle.properties
-          # JVM 配置
-          org.gradle.jvmargs=-Xmx${{ env.XMX }} -XX:+UseParallelGC -XX:MaxMetaspaceSize=${{ env.METASPACE }} -Dfile.encoding=UTF-8
-          # 并行构建
-          org.gradle.parallel=true
-          org.gradle.workers.max=${{ env.CORES }}
-          # 按需配置
-          org.gradle.configureondemand=true
-          # 构建缓存
-          org.gradle.caching=true
-          org.gradle.daemon=false
-          # Kotlin 编译优化
-          kotlin.incremental=true
-          kotlin.parallel.tasks.in.parallel=true
-          kotlin.code.style=official
-          # AndroidX
-          android.useAndroidX=true
-          android.enableJetifier=false
-          android.nonTransitiveRClass=true
-          EOF
-
-      # 9. 准备 .env 和 空壳 google-services.json
-      - name: Prepare configs
-        run: |
-          if [ -f .env.example ]; then cp .env.example .env; fi
-          echo "HF_ENDPOINT=https://hf-mirror.com" >> .env
-          
-          cat <<EOF > android/app/google-services.json
-          {
-            "project_info": {
-              "project_number": "000000000000",
-              "project_id": "dummy-project",
-              "storage_bucket": "dummy-project.appspot.com"
-            },
-            "client": [
-              {
-                "client_info": {
-                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
-                  "android_client_info": {
-                    "package_name": "com.pocketpalai"
-                  }
-                },
-                "oauth_client": [],
-                "api_key": [
-                  {
-                    "current_key": "AIzaSyDummy_key_for_ci_build_only"
-                  }
-                ],
-                "services": {
-                  "appinvite_service": {
-                    "other_platform_oauth_client": []
-                  }
-                }
-              }
-            ],
-            "configuration_version": "1"
-          }
-          EOF
-
-      # 10. 安装 JS 依赖
-      - name: Install dependencies
-        run: yarn install --immutable
-
-      # 11. 给 gradlew 执行权限
-      - name: Grant gradlew permission
-        run: chmod +x android/gradlew
-
-      # 12. 构建 Release APK
-      - name: Build Release APK
-        working-directory: android
-        run: ./gradlew assembleProdRelease --no-daemon --stacktrace
-
-      # 13. 上传产物
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pocketpal-ai-apk-${{ needs.determine-runner.outputs.runner }}
-          path: android/app/build/outputs/apk/prodRelease/*.apk
-          if-no-files-found: error
-          retention-days: 30
-
-      # 14. 发布到 Release（打 tag 时触发）
-      - name: Release APK on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: android/app/build/outputs/apk/prodRelease/*.apk
-          generate_release_notes: true
+          echo "========================================"
+          echo "✅ 测试成功！你的公开仓库最高可白嫖的配置为:"
+          echo "👉 运行器: ${{ needs.determine-runner.outputs.runner }}"
+          echo "👉 期望核心数: ${{ needs.determine-runner.outputs.cores }}"
+          echo "========================================"
+          echo ""
+          echo "开始验证真实机器物理性能..."
+          echo "--- CPU 核心数 ---"
+          nproc
+          echo ""
+          echo "--- 内存使用情况 ---"
+          free -h
+          echo ""
+          echo "--- 磁盘空间 ---"
+          df -h /
+          echo "========================================"
